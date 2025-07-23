@@ -23,7 +23,9 @@ use grpcio::{
     RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink, WriteFlags,
 };
 use health_controller::HealthController;
-use kvproto::{coprocessor::*, kvrpcpb::*, mpp::*, raft_serverpb::*, tikvpb::*};
+use kvproto::{
+    coprocessor::*, kvrpcpb::*, mpp::*, pdpb::ReportSplitRequest, raft_serverpb::*, tikvpb::*,
+};
 use protobuf::RepeatedField;
 use raft::eraftpb::MessageType;
 use raftstore::{
@@ -112,7 +114,7 @@ pub struct Service<E: Engine, L: LockManager, F: KvFormat> {
     // TODO: make it Some after GC is supported for v2.
     gc_worker: GcWorker<E>,
     // For handling KV requests.
-    storage: Storage<E, L, F>,
+    storage: Arc<Storage<E, L, F>>,
     // For handling coprocessor requests.
     copr: Endpoint<E>,
     // For handling coprocessor v2 requests.
@@ -138,6 +140,8 @@ pub struct Service<E: Engine, L: LockManager, F: KvFormat> {
     health_feedback_seq: Arc<AtomicU64>,
 
     raft_message_filter: Arc<dyn RaftGrpcMessageFilter>,
+
+    raft_client: TikvClient,
 }
 
 impl<E: Engine, L: LockManager, F: KvFormat> Drop for Service<E, L, F> {
@@ -166,6 +170,7 @@ impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E
             health_feedback_seq: self.health_feedback_seq.clone(),
             health_feedback_interval: self.health_feedback_interval,
             raft_message_filter: self.raft_message_filter.clone(),
+            raft_client: self.raft_client.clone(),
         }
     }
 }
@@ -175,7 +180,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
     pub fn new(
         cluster_id: u64,
         store_id: u64,
-        storage: Storage<E, L, F>,
+        storage: Arc<Storage<E, L, F>>,
         gc_worker: GcWorker<E>,
         copr: Endpoint<E>,
         copr_v2: coprocessor_v2::Endpoint,
@@ -189,11 +194,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
         health_controller: HealthController,
         health_feedback_interval: Option<Duration>,
         raft_message_filter: Arc<dyn RaftGrpcMessageFilter>,
+        raft_client: TikvClient,
     ) -> Self {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64;
+            .as_nanos() as u64;
         Service {
             cluster_id,
             store_id,
@@ -212,6 +218,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
             health_feedback_interval,
             health_feedback_seq: Arc::new(AtomicU64::new(now_unix)),
             raft_message_filter,
+            raft_client: raft_client,
         }
     }
 
@@ -784,50 +791,49 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         stream: RequestStream<RaftMessage>,
         sink: ClientStreamingSink<Done>,
     ) {
-        let source_store_id = Self::get_store_id_from_metadata(&ctx);
-        let message_received =
-            source_store_id.map(|x| MESSAGE_RECV_BY_STORE.with_label_values(&[&format!("{}", x)]));
-        info!(
-            "raft RPC is called, new gRPC stream established";
-            "source_store_id" => ?source_store_id,
-        );
-
-        let store_id = self.store_id;
-        let ch = self.storage.get_engine().raft_extension();
-        let ob = self.raft_message_filter.clone();
-
-        let res = async move {
+        println!("kv service raft");
+        let (mut raft_sink, raft_receiver) = self.raft_client.raft().unwrap();
+        
+        // 转发请求流
+        let forward_requests = async move {
             let mut stream = stream.map_err(Error::from);
-            while let Some(msg) = stream.try_next().await? {
-                RAFT_MESSAGE_RECV_COUNTER.inc();
-
-                if let Err(err @ RaftStoreError::StoreNotMatch { .. }) =
-                    Self::handle_raft_message(store_id, &ch, msg, &ob)
-                {
-                    // Return an error here will break the connection, only do that for
-                    // `StoreNotMatch` to let tikv to resolve a correct address from PD
-                    return Err(Error::from(err));
-                }
-                if let Some(ref counter) = message_received {
-                    counter.inc();
+            while let Some(msg_result) = stream.next().await {
+                match msg_result {
+                    Ok(m) => {
+                        if let Err(e) = raft_sink.send((m, WriteFlags::default())).await {
+                            return Err(Error::from(e));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::from(e));
+                    }
                 }
             }
+            // 关闭发送端
+            raft_sink.close().await?;
             Ok::<(), Error>(())
         };
-
-        ctx.spawn(async move {
-            let status = match res.await {
-                Err(e) => {
-                    let msg = format!("{:?}", e);
-                    error!("dispatch raft msg from gRPC to raftstore fail"; "err" => %msg);
-                    RpcStatus::with_message(RpcStatusCode::UNKNOWN, msg)
+        
+        // 转发响应
+        let forward_response = async {
+            match raft_receiver.await {
+                Ok(done) => {
+                    let _ = sink.success(done).await;
                 }
-                Ok(_) => RpcStatus::new(RpcStatusCode::UNKNOWN),
-            };
-            let _ = sink
-                .fail(status)
-                .map_err(|e| error!("KvService::raft send response fail"; "err" => ?e))
-                .await;
+                Err(e) => {
+                    let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, format!("{:?}", e));
+                    let _ = sink.fail(status).await;
+                }
+            }
+        };
+
+        ctx.spawn(async {
+           if let Err(e) = forward_requests.await {
+            let msg = format!("{:?}", e);
+            error!("dispatch raft msg from gRPC to raftstore fail"; "err" => %msg);
+           }
+
+           forward_response.await;
         });
     }
 
@@ -837,62 +843,49 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         stream: RequestStream<BatchRaftMessage>,
         sink: ClientStreamingSink<Done>,
     ) {
-        let source_store_id = Self::get_store_id_from_metadata(&ctx);
-        let message_received =
-            source_store_id.map(|x| MESSAGE_RECV_BY_STORE.with_label_values(&[&format!("{}", x)]));
-        info!(
-            "batch_raft RPC is called, new gRPC stream established";
-            "source_store_id" => ?source_store_id,
-        );
-
-        let store_id = self.store_id;
-        let ch = self.storage.get_engine().raft_extension();
-        let ob = self.raft_message_filter.clone();
-
-        let res = async move {
+        println!("kv service batch_raft");
+        let (mut raft_sink, raft_receiver) = self.raft_client.batch_raft().unwrap();
+        
+        // 转发请求流
+        let forward_requests = async move {
             let mut stream = stream.map_err(Error::from);
-            while let Some(mut batch_msg) = stream.try_next().await? {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos() as u64;
-                let elapsed = nanos_to_secs(now.saturating_sub(batch_msg.last_observed_time));
-                RAFT_MESSAGE_DURATION.receive_delay.observe(elapsed);
-
-                let len = batch_msg.get_msgs().len();
-                RAFT_MESSAGE_RECV_COUNTER.inc_by(len as u64);
-                RAFT_MESSAGE_BATCH_SIZE.observe(len as f64);
-
-                for msg in batch_msg.take_msgs().into_iter() {
-                    if let Err(err @ RaftStoreError::StoreNotMatch { .. }) =
-                        Self::handle_raft_message(store_id, &ch, msg, &ob)
-                    {
-                        // Return an error here will break the connection, only do that for
-                        // `StoreNotMatch` to let tikv to resolve a correct address from PD
-                        return Err(Error::from(err));
+            while let Some(msg_result) = stream.next().await {
+                match msg_result {
+                    Ok(batch_msg) => {
+                        if let Err(e) = raft_sink.send((batch_msg, WriteFlags::default())).await {
+                            return Err(Error::from(e));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::from(e));
                     }
                 }
-                if let Some(ref counter) = message_received {
-                    counter.inc_by(len as u64);
-                }
             }
+            // 关闭发送端
+            raft_sink.close().await?;
             Ok::<(), Error>(())
         };
 
-        ctx.spawn(async move {
-            let status = match res.await {
-                Err(e) => {
-                    fail_point!("on_batch_raft_stream_drop_by_err");
-                    let msg = format!("{:?}", e);
-                    error!("dispatch raft msg from gRPC to raftstore fail"; "err" => %msg);
-                    RpcStatus::with_message(RpcStatusCode::UNKNOWN, msg)
+        // 转发响应
+        let forward_response = async move {
+            match raft_receiver.await {
+                Ok(done) => {
+                    let _ = sink.success(done).await;
                 }
-                Ok(_) => RpcStatus::new(RpcStatusCode::UNKNOWN),
-            };
-            let _ = sink
-                .fail(status)
-                .map_err(|e| error!("KvService::batch_raft send response fail"; "err" => ?e))
-                .await;
+                Err(e) => {
+                    let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, format!("{:?}", e));
+                    let _ = sink.fail(status).await;
+                }
+            }
+        };
+
+        ctx.spawn(async move {
+            if let Err(e) = forward_requests.await {
+                let msg = format!("{:?}", e);
+                error!("dispatch raft msg from gRPC to raftstore fail"; "err" => %msg);
+               }
+
+            forward_response.await;
         });
     }
 
@@ -902,6 +895,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         stream: RequestStream<SnapshotChunk>,
         sink: ClientStreamingSink<Done>,
     ) {
+        println!("kv service snapshot");
         if self.raft_message_filter.should_reject_snapshot() {
             RAFT_SNAPSHOT_REJECTS.inc();
             let status =
@@ -909,16 +903,36 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             ctx.spawn(sink.fail(status).map(|_| ()));
             return;
         };
-        let task = SnapTask::Recv { stream, sink };
-        if let Err(e) = self.snap_scheduler.schedule(task) {
-            let err_msg = format!("{}", e);
-            let sink = match e.into_inner() {
-                SnapTask::Recv { sink, .. } => sink,
-                _ => unreachable!(),
-            };
-            let status = RpcStatus::with_message(RpcStatusCode::RESOURCE_EXHAUSTED, err_msg);
-            ctx.spawn(sink.fail(status).map(|_| ()));
-        }
+
+        let (mut raft_sink, _raft_receiver) = self.raft_client.snapshot().unwrap();
+        let res = async move {
+            let mut stream = stream.map_err(Error::from);
+            while let Some(msg_result) = stream.next().await {
+                match msg_result {
+                    Ok(chunk) => {
+                        if let Err(e) = raft_sink.send((chunk, WriteFlags::default())).await {
+                            return Err(Error::from(e));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Error::from(e));
+                    }
+                }
+            }
+            Ok::<(), Error>(())
+        };
+
+        ctx.spawn(async move {
+            if let Err(e) = res.await {
+                let msg = format!("{:?}", e);
+                error!("dispatch snapshot msg from gRPC to raftstore fail"; "err" => %msg);
+                let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, msg);
+                let _ = sink
+                    .fail(status)
+                    .map_err(|e| error!("KvService::snapshot send response fail"; "err" => ?e))
+                    .await;
+            }
+        });
     }
 
     fn tablet_snapshot(
@@ -927,106 +941,94 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         stream: RequestStream<TabletSnapshotRequest>,
         sink: DuplexSink<TabletSnapshotResponse>,
     ) {
-        let task = SnapTask::RecvTablet { stream, sink };
-        if let Err(e) = self.snap_scheduler.schedule(task) {
-            let err_msg = format!("{}", e);
-            let sink = match e.into_inner() {
-                SnapTask::Recv { sink, .. } => sink,
-                _ => unreachable!(),
-            };
-            let status = RpcStatus::with_message(RpcStatusCode::RESOURCE_EXHAUSTED, err_msg);
-            ctx.spawn(sink.fail(status).map(|_| ()));
-        }
+        println!("kv service tablet_snapshot");
+        let (mut raft_sink, mut raft_stream) = self.raft_client.tablet_snapshot().unwrap();
+
+        ctx.spawn(async move {
+            let mut sink = sink;
+            let forward_req = async {
+                let mut client_to_raft = stream.map_err(Error::from);
+                while let Some(req) = client_to_raft.next().await {
+                    match req {
+                        Ok(r) => {
+                            if let Err(e) = raft_sink.send((r, WriteFlags::default())).await {
+                                return Err(Error::from(e));
+                            }
+                        }
+                        Err(e) => return Err(Error::from(e)),
+                    }
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(e) = forward_req {
+                let msg = format!("{:?}", e);
+                error!("dispatch tablet_snapshot msg from gRPC to raftstore fail"; "err" => %msg);
+                let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, msg);
+                let _ = sink
+                    .fail(status)
+                    .map_err(
+                        |e| error!("KvService::tablet_snapshot send response fail"; "err" => ?e),
+                    )
+                    .await;
+                return;
+            }
+
+            let forward_resp = async {
+                let mut raft_to_client = raft_stream.map_err(Error::from);
+                while let Some(resp) = raft_to_client.next().await {
+                    match resp {
+                        Ok(r) => {
+                            if let Err(e) = sink.send((r, WriteFlags::default())).await {
+                                return Err(Error::from(e));
+                            }
+                        }
+                        Err(e) => return Err(Error::from(e)),
+                    }
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+
+            if let Err(e) = forward_resp {
+                let msg = format!("{:?}", e);
+                error!("dispatch tablet_snapshot msg from gRPC to raftstore fail"; "err" => %msg);
+                let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, msg);
+                let _ = sink
+                    .fail(status)
+                    .map_err(
+                        |e| error!("KvService::tablet_snapshot send response fail"; "err" => ?e),
+                    )
+                    .await;
+                return;
+            }
+        });
     }
 
     #[allow(clippy::collapsible_else_if)]
     fn split_region(
         &mut self,
         ctx: RpcContext<'_>,
-        mut req: SplitRegionRequest,
+        req: SplitRegionRequest,
         sink: UnarySink<SplitRegionResponse>,
     ) {
-        forward_unary!(self.proxy, split_region, ctx, req, sink);
-        let begin_instant = Instant::now();
-
-        let region_id = req.get_context().get_region_id();
-        let mut split_keys = if req.is_raw_kv {
-            if !req.get_split_key().is_empty() {
-                vec![F::encode_raw_key_owned(req.take_split_key(), None).into_encoded()]
-            } else {
-                req.take_split_keys()
-                    .into_iter()
-                    .map(|x| F::encode_raw_key_owned(x, None).into_encoded())
-                    .collect()
-            }
-        } else {
-            if !req.get_split_key().is_empty() {
-                vec![Key::from_raw(req.get_split_key()).into_encoded()]
-            } else {
-                req.take_split_keys()
-                    .into_iter()
-                    .map(|x| Key::from_raw(&x).into_encoded())
-                    .collect()
-            }
-        };
-        split_keys.sort();
-        let engine = self.storage.get_engine();
-        let f = engine.raft_extension().split(
-            region_id,
-            req.take_context().take_region_epoch(),
-            split_keys,
-            ctx.peer(),
-        );
-
-        let task = async move {
-            let res = f.await;
-            let mut resp = SplitRegionResponse::default();
-            match res {
-                Ok(regions) => {
-                    if regions.len() < 2 {
-                        error!(
-                            "invalid split response";
-                            "region_id" => region_id,
-                            "resp" => ?regions
-                        );
-                        resp.mut_region_error().set_message(format!(
-                            "Internal Error: invalid response: {:?}",
-                            regions
-                        ));
-                    } else {
-                        if regions.len() == 2 {
-                            resp.set_left(regions[0].clone());
-                            resp.set_right(regions[1].clone());
-                        }
-                        resp.set_regions(regions.into());
+        println!("kv service split_region");
+        let raft_client = self.raft_client.clone();
+        ctx.spawn(async move {
+            match raft_client.split_region(&req) {
+                Ok(resp) => {
+                    if let Err(e) = sink.success(resp).await {
+                        error!("KvService::split_region send response fail"; "err" => ?e);
                     }
                 }
                 Err(e) => {
-                    let err: crate::storage::Result<()> = Err(e.into());
-                    if let Some(err) = extract_region_error(&err) {
-                        resp.set_region_error(err)
-                    } else {
-                        resp.mut_region_error()
-                            .set_message(format!("failed to split: {:?}", err));
-                    }
+                    let msg = format!("{:?}", e);
+                    error!("dispatch split_region msg from gRPC to raftstore fail"; "err" => %msg);
+                    let status = RpcStatus::with_message(RpcStatusCode::UNKNOWN, msg);
+                    let _ = sink.fail(status).await;
                 }
             }
-            GRPC_MSG_HISTOGRAM_STATIC
-                .split_region
-                .unknown
-                .observe(begin_instant.saturating_elapsed().as_secs_f64());
-            sink.success(resp).await?;
-            ServerResult::Ok(())
-        }
-        .map_err(|e| {
-            log_net_error!(e, "kv rpc failed";
-                "request" => "split_region"
-            );
-            GRPC_MSG_FAIL_COUNTER.split_region.inc();
-        })
-        .map(|_| ());
-
-        ctx.spawn(task);
+        });
     }
 
     fn batch_commands(

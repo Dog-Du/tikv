@@ -297,7 +297,7 @@ pub struct ServerCluster<EK: KvEngine> {
     conn_builder: ConnectionBuilder<AddressMap, FakeExtension>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
     env: Arc<Environment>,
-    raft_client_env: Arc<Environment>,
+    raft_env: Arc<Environment>,
     pub pending_services: HashMap<u64, PendingServices>,
     // This is used to work around that server cluster is generic over KvEngine while the debug
     // service implementation is specific overal RocksDB.
@@ -317,7 +317,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 .build(),
         );
 
-        let raft_client_env = Arc::new(
+        let raft_env = Arc::new(
             EnvBuilder::new()
                 .cq_count(2)
                 .name_prefix(thd_name!("server-cluster"))
@@ -354,7 +354,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
             conn_builder,
             concurrency_managers: HashMap::default(),
             env,
-            raft_client_env,
+            raft_env,
             txn_extra_schedulers: HashMap::default(),
             causal_ts_providers: HashMap::default(),
         }
@@ -648,7 +648,7 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 gc_worker.clone(),
                 check_leader_scheduler.clone(),
                 self.env.clone(),
-                self.raft_client_env.clone(),
+                self.raft_env.clone(),
                 None,
                 debug_thread_pool.clone(),
                 health_controller.clone(),

@@ -4,6 +4,7 @@ mod batch;
 mod debug;
 pub mod diagnostics;
 mod kv;
+pub mod raft;
 
 pub use self::{
     debug::{ResolvedTsDiagnosisCallback, Service as DebugService},
@@ -14,6 +15,7 @@ pub use self::{
         batch_commands_request, batch_commands_response, future_flashback_to_version,
         future_prepare_flashback_to_version,
     },
+    raft::{RaftService, create_raft_service},
 };
 
 #[macro_export]

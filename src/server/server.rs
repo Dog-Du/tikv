@@ -8,7 +8,7 @@ use std::{
 };
 
 use api_version::KvFormat;
-use futures::{compat::Stream01CompatExt, stream::StreamExt};
+use futures::{TryFutureExt, compat::Stream01CompatExt, stream::StreamExt};
 use grpcio::{
     ChannelBuilder,
     CompressionLevel::{
@@ -22,8 +22,9 @@ use kvproto::tikvpb::*;
 use raftstore::store::{CheckLeaderTask, SnapManager, TabletSnapManager};
 use resource_control::ResourceGroupManager;
 use security::SecurityManager;
+use tikv_kv::RaftExtension;
 use tikv_util::{
-    Either,
+    Either, box_err,
     config::VersionTrack,
     sys::{get_global_memory_usage, record_global_memory_usage},
     timer::GLOBAL_TIMER_HANDLE,
@@ -36,7 +37,6 @@ use super::{
     Config, Error, Result,
     load_statistics::*,
     metrics::{MEMORY_USAGE_GAUGE, SERVER_INFO_GAUGE_VEC},
-    raft_client::{ConnectionBuilder, RaftClient},
     resolve::StoreAddrResolver,
     service::*,
     snap::{Runner as SnapHandler, Task as SnapTask},
@@ -47,7 +47,13 @@ use crate::{
     coprocessor::Endpoint,
     coprocessor_v2,
     read_pool::ReadPool,
-    server::{Proxy, config::GrpcCompressionType, gc_worker::GcWorker, tablet_snap::TabletRunner},
+    server::{
+        ConnectionBuilder, Proxy, RaftClient,
+        config::GrpcCompressionType,
+        gc_worker::GcWorker,
+        service::raft::{RaftService, create_raft_service},
+        tablet_snap::TabletRunner,
+    },
     storage::{Engine, Storage, lock_manager::LockManager},
     tikv_util::sys::thread::ThreadBuildWrapper,
 };
@@ -62,37 +68,76 @@ pub const STATS_THREAD_PREFIX: &str = "transport-stats";
 
 pub trait GrpcBuilderFactory {
     fn create_builder(&self, env: Arc<Environment>) -> Result<ServerBuilder>;
+    fn create_raft_builder(&self, env: Arc<Environment>) -> Result<ServerBuilder>;
 }
 
-struct BuilderFactory<S: Tikv + Send + Clone + 'static> {
-    kv_service: S,
+struct BuilderFactory<
+    S: Tikv + Send + Clone + 'static,
+    R: RaftExtension + Clone + Send + 'static,
+    E: Engine,
+    L: LockManager,
+    F: KvFormat,
+> {
     cfg: Arc<VersionTrack<Config>>,
     security_mgr: Arc<SecurityManager>,
     health_service: HealthService,
+    cluster_id: u64,
+    store_id: u64,
+    raft_router: Option<R>,
+    raft_message_filter: Option<Arc<dyn RaftGrpcMessageFilter>>,
+    snap_scheduler: Scheduler<SnapTask>,
+    storage: Arc<Storage<E, L, F>>,
+    proxy: Proxy,
+    kv_service: Option<S>,
 }
 
-impl<S> BuilderFactory<S>
+impl<S, R, E, L, F> BuilderFactory<S, R, E, L, F>
 where
     S: Tikv + Send + Clone + 'static,
+    R: RaftExtension + Clone + Send + 'static,
+    E: Engine,
+    L: LockManager,
+    F: KvFormat,
 {
     pub fn new(
-        kv_service: S,
         cfg: Arc<VersionTrack<Config>>,
         security_mgr: Arc<SecurityManager>,
         health_service: HealthService,
-    ) -> BuilderFactory<S> {
+        cluster_id: u64,
+        store_id: u64,
+        raft_router: R,
+        raft_message_filter: Arc<dyn RaftGrpcMessageFilter>,
+        snap_scheduler: Scheduler<SnapTask>,
+        storage: Arc<Storage<E, L, F>>,
+        proxy: Proxy,
+    ) -> BuilderFactory<S, R, E, L, F> {
         BuilderFactory {
-            kv_service,
             cfg,
             security_mgr,
             health_service,
+            cluster_id,
+            store_id,
+            raft_router: Some(raft_router),
+            raft_message_filter: Some(raft_message_filter),
+            snap_scheduler,
+            storage,
+            proxy,
+            kv_service: None,
         }
+    }
+
+    fn set_kv_service(&mut self, kv_service: S) {
+        self.kv_service = Some(kv_service);
     }
 }
 
-impl<S> GrpcBuilderFactory for BuilderFactory<S>
+impl<S, R, E, L, F> GrpcBuilderFactory for BuilderFactory<S, R, E, L, F>
 where
     S: Tikv + Send + Clone + 'static,
+    R: RaftExtension + Clone + Send + 'static,
+    E: Engine,
+    L: LockManager,
+    F: KvFormat,
 {
     fn create_builder(&self, env: Arc<Environment>) -> Result<ServerBuilder> {
         let addr = SocketAddr::from_str(&self.cfg.value().addr)?;
@@ -108,7 +153,7 @@ where
         // See CompressionAlgorithmForLevel in gRPC implementation for details.
         //
         // We cannot set default compression algorithm here, because it won't check
-        // whether the client side supports the algorithm
+        // whether the client side supports the algorithm.
         let compression_level = match self.cfg.value().grpc_compression_type {
             GrpcCompressionType::None => GRPC_COMPRESS_LEVEL_NONE,
             GrpcCompressionType::Deflate => GRPC_COMPRESS_LEVEL_HIGH,
@@ -127,24 +172,80 @@ where
             .default_compression_level(compression_level)
             .build_args();
 
+        // kv_service register in grpc
         let sb = ServerBuilder::new(Arc::clone(&env))
             .channel_args(channel_args)
-            .register_service(create_tikv(self.kv_service.clone()))
+            .register_service(create_tikv(self.kv_service.clone().unwrap()))
             .register_service(create_health(self.health_service.clone()));
         Ok(self.security_mgr.bind(sb, &ip, addr.port()))
     }
-}
 
+    fn create_raft_builder(&self, env: Arc<Environment>) -> Result<ServerBuilder> {
+        let addr = SocketAddr::from_str(&self.cfg.value().raft_grpc_addr)?;
+        let ip: String = format!("{}", addr.ip());
+        let mem_quota = ResourceQuota::new(Some("RaftServerMemQuota"))
+            .resize_memory(self.cfg.value().raft_grpc_memory_pool_quota.0 as usize);
+
+        let compression_level = match self.cfg.value().grpc_compression_type {
+            GrpcCompressionType::None => GRPC_COMPRESS_LEVEL_NONE,
+            GrpcCompressionType::Deflate => GRPC_COMPRESS_LEVEL_HIGH,
+            GrpcCompressionType::Gzip => GRPC_COMPRESS_LEVEL_LOW,
+        };
+
+        let channel_args = ChannelBuilder::new(Arc::clone(&env))
+            .stream_initial_window_size(
+                self.cfg.value().raft_grpc_stream_initial_window_size.0 as i32,
+            )
+            .max_concurrent_stream(self.cfg.value().raft_grpc_concurrent_stream)
+            .max_receive_message_len(-1)
+            .set_resource_quota(mem_quota)
+            .max_send_message_len(-1)
+            .http2_max_ping_strikes(i32::MAX)
+            .keepalive_time(self.cfg.value().raft_grpc_keepalive_time.into())
+            .keepalive_timeout(self.cfg.value().raft_grpc_keepalive_timeout.into())
+            .default_gzip_compression_level(self.cfg.value().raft_grpc_gzip_compression_level)
+            .default_compression_level(compression_level)
+            .build_args();
+
+        // 创建专门的 Raft 服务
+        if let (Some(raft_router), Some(raft_message_filter)) =
+            (self.raft_router.as_ref(), self.raft_message_filter.as_ref())
+        {
+            let raft_service = RaftService::new(
+                self.cluster_id,
+                self.store_id,
+                raft_router.clone(),
+                self.snap_scheduler.clone(),
+                self.storage.clone(),
+                self.proxy.clone(),
+                raft_message_filter.clone(),
+            );
+
+            // raft_service register in raft grpc
+            let sb = ServerBuilder::new(Arc::clone(&env))
+                .channel_args(channel_args)
+                .register_service(create_raft_service(raft_service))
+                .register_service(create_health(self.health_service.clone()));
+            Ok(self.security_mgr.bind(sb, &ip, addr.port()))
+        } else {
+            Err(Error::Other(box_err!("Raft components not configured")))
+        }
+    }
+}
 /// The TiKV server
 ///
 /// It hosts various internal components, including gRPC, the raftstore router
 /// and a snapshot worker.
 pub struct Server<S: StoreAddrResolver + 'static, E: Engine> {
+    /// `env` for external grpc Environment
+    /// `raft_env` for raft Environment
     env: Arc<Environment>,
+    raft_env: Arc<Environment>,
     /// A GrpcServer builder or a GrpcServer.
     ///
     /// If the listening port is configured, the server will be started lazily.
     builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
+    raft_builder_or_server: Option<Either<ServerBuilder, GrpcServer>>,
     grpc_mem_quota: ResourceQuota,
     local_addr: SocketAddr,
     // Transport.
@@ -183,7 +284,7 @@ where
         gc_worker: GcWorker<E>,
         check_leader_scheduler: Scheduler<CheckLeaderTask>,
         env: Arc<Environment>,
-        raft_client_env: Arc<Environment>,
+        raft_env: Arc<Environment>,
         yatp_read_pool: Option<ReadPool>,
         debug_thread_pool: Arc<Runtime>,
         health_controller: HealthController,
@@ -217,39 +318,17 @@ where
             Some(cfg.value().health_feedback_interval.0)
         };
 
-        let proxy = Proxy::new(security_mgr.clone(), &env, Arc::new(cfg.value().clone()));
-        let kv_service = KvService::new(
-            cfg.value().cluster_id,
-            store_id,
-            storage,
-            gc_worker,
-            copr,
-            copr_v2,
-            lazy_worker.scheduler(),
-            check_leader_scheduler,
-            Arc::clone(&grpc_thread_load),
-            cfg.value().enable_request_batch,
-            proxy,
-            cfg.value().reject_messages_on_memory_ratio,
-            resource_manager,
-            health_controller.clone(),
-            health_feedback_interval,
-            raft_message_filter,
-        );
-        let builder_factory = Box::new(BuilderFactory::new(
-            kv_service,
-            cfg.clone(),
+        let proxy = Proxy::new(
             security_mgr.clone(),
-            health_controller.get_grpc_health_service(),
-        ));
+            &raft_env,
+            Arc::new(cfg.value().clone()),
+        );
 
         let addr = SocketAddr::from_str(&cfg.value().addr)?;
-        let mem_quota = ResourceQuota::new(Some("ServerMemQuota"))
-            .resize_memory(cfg.value().grpc_memory_pool_quota.0 as usize);
-        let builder = Either::Left(builder_factory.create_builder(env.clone())?);
-
+        let mem_quota = ResourceQuota::new(Some("RaftServerMemQuota"))
+            .resize_memory(cfg.value().raft_grpc_memory_pool_quota.0 as usize);
         let conn_builder = ConnectionBuilder::new(
-            raft_client_env.clone(),
+            raft_env.clone(),
             Arc::clone(cfg),
             security_mgr.clone(),
             resolver,
@@ -261,9 +340,52 @@ where
 
         let trans = ServerTransport::new(raft_client);
 
+        let mut builder_factory = Box::new(BuilderFactory::new(
+            cfg.clone(),
+            security_mgr.clone(),
+            health_controller.get_grpc_health_service(),
+            cfg.value().cluster_id,
+            store_id,
+            raft_ext.clone(),
+            raft_message_filter.clone(),
+            lazy_worker.scheduler(),
+            Arc::new(storage.clone()),
+            proxy.clone(),
+        ));
+        let raft_builder = Either::Left(builder_factory.create_raft_builder(raft_env.clone())?);
+
+        let raft_addr = cfg.value().raft_grpc_addr.clone();
+        let ch = ChannelBuilder::new(raft_env.clone()).connect(raft_addr.as_str());
+        let raft_client = TikvClient::new(ch);
+
+        let kv_service = KvService::new(
+            cfg.value().cluster_id,
+            store_id,
+            storage.clone(),
+            gc_worker,
+            copr,
+            copr_v2,
+            lazy_worker.scheduler(),
+            check_leader_scheduler,
+            Arc::clone(&grpc_thread_load),
+            cfg.value().enable_request_batch,
+            proxy.clone(),
+            cfg.value().reject_messages_on_memory_ratio,
+            resource_manager,
+            health_controller.clone(),
+            health_feedback_interval,
+            raft_message_filter.clone(),
+            raft_client,
+        );
+
+        builder_factory.set_kv_service(kv_service);
+        let builder = Either::Left(builder_factory.create_builder(env.clone())?);
+
         let svr = Server {
             env: Arc::clone(&env),
+            raft_env: Arc::clone(&raft_env),
             builder_or_server: Some(builder),
+            raft_builder_or_server: Some(raft_builder),
             grpc_mem_quota: mem_quota,
             local_addr: addr,
             trans,
@@ -278,7 +400,6 @@ where
             timer: GLOBAL_TIMER_HANDLE.clone(),
             builder_factory,
         };
-
         Ok(svr)
     }
 
@@ -296,6 +417,10 @@ where
 
     pub fn env(&self) -> Arc<Environment> {
         self.env.clone()
+    }
+
+    pub fn raft_env(&self) -> Arc<Environment> {
+        self.raft_env.clone()
     }
 
     pub fn get_grpc_mem_quota(&self) -> &ResourceQuota {
@@ -327,14 +452,29 @@ where
         let addr = SocketAddr::new(IpAddr::from_str(host)?, port);
         self.local_addr = addr;
         self.builder_or_server = Some(Either::Right(server));
+
+        let raft_sb = self.raft_builder_or_server.take().unwrap().left().unwrap();
+        let raft_server = raft_sb.build()?;
+        let (raft_host, raft_port) = raft_server.bind_addrs().next().unwrap();
+        let raft_addr = SocketAddr::new(IpAddr::from_str(raft_host)?, raft_port);
+        self.raft_builder_or_server = Some(Either::Right(raft_server));
+
+        info!("External gRPC server listening on: {}", addr);
+        info!("Raft gRPC server listening on: {}", raft_addr);
+
         Ok(addr)
     }
 
     fn start_grpc(&mut self) {
-        info!("listening on addr"; "addr" => &self.local_addr);
+        info!("External gRPC server listening on addr"; "addr" => &self.local_addr);
         let mut grpc_server = self.builder_or_server.take().unwrap().right().unwrap();
         grpc_server.start();
         self.builder_or_server = Some(Either::Right(grpc_server));
+
+        let mut raft_grpc_server = self.raft_builder_or_server.take().unwrap().right().unwrap();
+        raft_grpc_server.start();
+        self.raft_builder_or_server = Some(Either::Right(raft_grpc_server));
+
         self.health_controller.set_is_serving(true);
     }
 
@@ -421,6 +561,9 @@ where
         if let Some(Either::Right(mut server)) = self.builder_or_server.take() {
             server.shutdown();
         }
+        if let Some(Either::Right(mut raft_server)) = self.raft_builder_or_server.take() {
+            raft_server.shutdown();
+        }
         if let Some(pool) = self.stats_pool.take() {
             pool.shutdown_background();
         }
@@ -437,8 +580,18 @@ where
         if let Some(Either::Right(server)) = self.builder_or_server.take() {
             drop(server);
         }
+
+        let raft_builder = Either::Left(
+            self.builder_factory
+                .create_raft_builder(self.raft_env.clone())?,
+        );
+        if let Some(Either::Right(raft_server)) = self.raft_builder_or_server.take() {
+            drop(raft_server);
+        }
+
         self.health_controller.set_is_serving(false);
         self.builder_or_server = Some(builder);
+        self.raft_builder_or_server = Some(raft_builder);
         info!("paused the grpc server"; "takes" => ?start.elapsed(),);
         Ok(())
     }
@@ -452,6 +605,15 @@ where
             info!("resumed the grpc server"; "takes" => ?start.elapsed(),);
             return Ok(());
         }
+
+        if let Some(raft_builder) = self.raft_builder_or_server.as_ref() {
+            let start = Instant::now();
+            assert!(raft_builder.is_left());
+            self.build_and_bind()?;
+            self.start_grpc();
+            info!("resumed the raft grpc server"; "takes" => ?start.elapsed(),);
+            return Ok(());
+        }
         Err(Error::Other(box_err!("resume the grpc server is skipped.")))
     }
 
@@ -460,6 +622,18 @@ where
     // in test to avoid port conflict.
     pub fn listening_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Get the listening address of the Raft gRPC server.
+    pub fn raft_listening_addr(&self) -> Option<SocketAddr> {
+        if let Some(Either::Right(ref raft_server)) = self.raft_builder_or_server {
+            if let Some((host, port)) = raft_server.bind_addrs().next() {
+                if let Ok(ip) = IpAddr::from_str(host) {
+                    return Some(SocketAddr::new(ip, port));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -649,7 +823,7 @@ mod tests {
                 .build(),
         );
 
-        let raft_client_env = Arc::new(
+        let raft_env = Arc::new(
             EnvBuilder::new()
                 .cq_count(1)
                 .name_prefix(thd_name!(RAFT_CLIENT_THREAD_PREFIX))
@@ -710,7 +884,7 @@ mod tests {
             gc_worker,
             check_leader_scheduler,
             env,
-            raft_client_env,
+            raft_env,
             None,
             debug_thread_pool,
             HealthController::new(),

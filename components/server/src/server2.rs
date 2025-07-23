@@ -247,7 +247,7 @@ struct TikvServer<ER: RaftEngine> {
     coprocessor_host: Option<CoprocessorHost<RocksEngine>>,
     concurrency_manager: ConcurrencyManager,
     env: Arc<Environment>,
-    raft_client_env: Arc<Environment>,
+    raft_env: Arc<Environment>,
     cdc_worker: Option<Box<LazyWorker<cdc::Task>>>,
     cdc_scheduler: Option<Scheduler<cdc::Task>>,
     cdc_memory_quota: Option<Arc<MemoryQuota>>,
@@ -309,9 +309,9 @@ where
                 .build(),
         );
 
-        let raft_client_env = Arc::new(
+        let raft_env = Arc::new(
             EnvBuilder::new()
-                .cq_count(config.server.raft_client_concurrency)
+                .cq_count(config.server.raft_grpc_concurrency)
                 .name_prefix(thd_name!(RAFT_CLIENT_THREAD_PREFIX))
                 .build(),
         );
@@ -418,7 +418,7 @@ where
             coprocessor_host: None,
             concurrency_manager,
             env,
-            raft_client_env,
+            raft_env,
             cdc_worker: None,
             cdc_scheduler: None,
             cdc_memory_quota: None,
@@ -836,7 +836,7 @@ where
             gc_worker.clone(),
             check_leader_scheduler,
             self.env.clone(),
-            self.raft_client_env.clone(),
+            self.raft_env.clone(),
             unified_read_pool,
             debug_thread_pool,
             health_controller,

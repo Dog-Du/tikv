@@ -21,9 +21,10 @@ pub use crate::storage::config::Config as StorageConfig;
 
 pub const DEFAULT_CLUSTER_ID: u64 = 0;
 pub const DEFAULT_LISTENING_ADDR: &str = "127.0.0.1:20160";
+pub const DEFAULT_LISTENING_RAFT_GRPC_ADDR: &str = "127.0.0.1:20161";
+
 const DEFAULT_ADVERTISE_LISTENING_ADDR: &str = "";
 const DEFAULT_STATUS_ADDR: &str = "127.0.0.1:20180";
-const DEFAULT_RAFT_CLIENT_CONCURRENCY: usize = 3;
 const DEFAULT_GRPC_CONCURRENCY: usize = 5;
 const DEFAULT_GRPC_CONCURRENT_STREAM: i32 = 1024;
 const DEFAULT_GRPC_RAFT_CONN_NUM: usize = 1;
@@ -31,6 +32,14 @@ const DEFAULT_GRPC_MEMORY_POOL_QUOTA: u64 = isize::MAX as u64;
 const DEFAULT_GRPC_STREAM_INITIAL_WINDOW_SIZE: u64 = 2 * 1024 * 1024;
 const DEFAULT_GRPC_GZIP_COMPRESSION_LEVEL: usize = 2;
 const DEFAULT_GRPC_MIN_MESSAGE_SIZE_TO_COMPRESS: usize = 4096;
+
+const DEFAULT_RAFT_GRPC_CONCURRENCY: usize = 5;
+const DEFAULT_RAFT_GRPC_CONCURRENT_STREAM: i32 = 1024;
+const DEFAULT_RAFT_GRPC_RAFT_CONN_NUM: usize = 1;
+const DEFAULT_RAFT_GRPC_MEMORY_POOL_QUOTA: u64 = isize::MAX as u64;
+const DEFAULT_RAFT_GRPC_STREAM_INITIAL_WINDOW_SIZE: u64 = 2 * 1024 * 1024;
+const DEFAULT_RAFT_GRPC_GZIP_COMPRESSION_LEVEL: usize = 2;
+const DEFAULT_RAFT_GRPC_MIN_MESSAGE_SIZE_TO_COMPRESS: usize = 4096;
 
 // Number of rows in each chunk.
 const DEFAULT_ENDPOINT_BATCH_ROW_LIMIT: usize = 64;
@@ -94,6 +103,10 @@ pub struct Config {
     #[online_config(skip)]
     pub addr: String,
 
+    // raft Server listening address.
+    #[online_config(skip)]
+    pub raft_grpc_addr: String,
+
     // Server advertise listening address for outer communication.
     // If not set, we will use listening address instead.
     #[online_config(skip)]
@@ -118,8 +131,7 @@ pub struct Config {
     pub raft_client_grpc_send_msg_buffer: usize,
     #[online_config(skip)]
     pub raft_client_queue_size: usize,
-    #[online_config(skip)]
-    pub raft_client_concurrency: usize,
+
     // Test only
     #[doc(hidden)]
     #[serde(skip_serializing)]
@@ -153,6 +165,27 @@ pub struct Config {
     pub grpc_keepalive_time: ReadableDuration,
     #[online_config(skip)]
     pub grpc_keepalive_timeout: ReadableDuration,
+
+    #[online_config(skip)]
+    pub raft_grpc_compression_type: GrpcCompressionType,
+    #[online_config(skip)]
+    pub raft_grpc_gzip_compression_level: usize,
+    #[online_config(skip)]
+    pub raft_grpc_min_message_size_to_compress: usize,
+    #[online_config(skip)]
+    pub raft_grpc_concurrency: usize,
+    #[online_config(skip)]
+    pub raft_grpc_concurrent_stream: i32,
+    #[online_config(skip)]
+    pub raft_grpc_raft_conn_num: usize,
+    pub raft_grpc_memory_pool_quota: ReadableSize,
+    #[online_config(skip)]
+    pub raft_grpc_stream_initial_window_size: ReadableSize,
+    #[online_config(skip)]
+    pub raft_grpc_keepalive_time: ReadableDuration,
+    #[online_config(skip)]
+    pub raft_grpc_keepalive_timeout: ReadableDuration,
+
     /// How many snapshots can be sent concurrently.
     pub concurrent_send_snap_limit: usize,
     /// How many snapshots can be recv concurrently.
@@ -254,6 +287,7 @@ impl Default for Config {
         Config {
             cluster_id: DEFAULT_CLUSTER_ID,
             addr: DEFAULT_LISTENING_ADDR.to_owned(),
+            raft_grpc_addr: DEFAULT_LISTENING_RAFT_GRPC_ADDR.to_owned(),
             labels: HashMap::default(),
             advertise_addr: DEFAULT_ADVERTISE_LISTENING_ADDR.to_owned(),
             status_addr: DEFAULT_STATUS_ADDR.to_owned(),
@@ -265,7 +299,6 @@ impl Default for Config {
             // increased from 8192 to 16384 to reduce the message delays under too many messages
             // load. Additionally, the raft_msg_max_batch_size has also been increased.
             raft_client_queue_size: 16384,
-            raft_client_concurrency: DEFAULT_RAFT_CLIENT_CONCURRENCY,
             raft_client_max_backoff: ReadableDuration::secs(5),
             raft_client_initial_reconnect_backoff: ReadableDuration::secs(1),
             raft_msg_max_batch_size: 256,
@@ -281,6 +314,20 @@ impl Default for Config {
             // than 10 senconds.
             grpc_keepalive_time: ReadableDuration::secs(10),
             grpc_keepalive_timeout: ReadableDuration::secs(3),
+
+            raft_grpc_compression_type: GrpcCompressionType::None,
+            raft_grpc_gzip_compression_level: DEFAULT_RAFT_GRPC_GZIP_COMPRESSION_LEVEL,
+            raft_grpc_min_message_size_to_compress: DEFAULT_RAFT_GRPC_MIN_MESSAGE_SIZE_TO_COMPRESS,
+            raft_grpc_concurrency: DEFAULT_RAFT_GRPC_CONCURRENCY,
+            raft_grpc_concurrent_stream: DEFAULT_RAFT_GRPC_CONCURRENT_STREAM,
+            raft_grpc_raft_conn_num: DEFAULT_RAFT_GRPC_RAFT_CONN_NUM,
+            raft_grpc_memory_pool_quota: ReadableSize(DEFAULT_RAFT_GRPC_MEMORY_POOL_QUOTA),
+            raft_grpc_stream_initial_window_size: ReadableSize(
+                DEFAULT_RAFT_GRPC_STREAM_INITIAL_WINDOW_SIZE,
+            ),
+            raft_grpc_keepalive_time: ReadableDuration::secs(10),
+            raft_grpc_keepalive_timeout: ReadableDuration::secs(3),
+
             concurrent_send_snap_limit: 32,
             concurrent_recv_snap_limit: 32,
             end_point_concurrency: None, // deprecated

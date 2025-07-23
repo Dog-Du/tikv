@@ -267,7 +267,7 @@ where
     coprocessor_host: Option<CoprocessorHost<RocksEngine>>,
     concurrency_manager: ConcurrencyManager,
     env: Arc<Environment>,
-    raft_client_env: Arc<Environment>,
+    raft_env: Arc<Environment>,
     check_leader_worker: Worker,
     sst_worker: Option<Box<LazyWorker<String>>>,
     quota_limiter: Arc<QuotaLimiter>,
@@ -338,9 +338,9 @@ where
                 .build(),
         );
 
-        let raft_client_env = Arc::new(
+        let raft_env = Arc::new(
             EnvBuilder::new()
-                .cq_count(config.server.raft_client_concurrency)
+                .cq_count(config.server.raft_grpc_concurrency)
                 .name_prefix(thd_name!(RAFT_CLIENT_THREAD_PREFIX))
                 .build(),
         );
@@ -483,7 +483,7 @@ where
             coprocessor_host,
             concurrency_manager,
             env,
-            raft_client_env,
+            raft_env,
             check_leader_worker,
             sst_worker: None,
             quota_limiter,
@@ -898,7 +898,7 @@ where
             gc_worker.clone(),
             check_leader_scheduler,
             self.env.clone(),
-            self.raft_client_env.clone(),
+            self.raft_env.clone(),
             unified_read_pool,
             debug_thread_pool,
             health_controller,

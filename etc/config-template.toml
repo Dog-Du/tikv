@@ -202,10 +202,13 @@
 # grpc-concurrency = 5
 
 ## Size of the thread pool for the raft client.
-# raft-client-concurrency = 5
+# raft-concurrency = 5
 
-## The number of max concurrent streams/requests on a client connection.
+## The number of max concurrent streams/requests on a grpc client connection.
 # grpc-concurrent-stream = 1024
+
+## The number of max concurrent streams/requests on a raft client connection.
+# raft-concurrent-stream = 1024
 
 ## Limit the memory size can be used by gRPC. Default is unlimited.
 ## gRPC usually works well to reclaim memory by itself. Limit the memory in case OOM
